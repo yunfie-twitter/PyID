@@ -1,0 +1,141 @@
+version: '3.9'
+
+services:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PostgreSQL Database
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  postgres:
+    image: postgres:16-alpine
+    container_name: sso-idp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sso_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sso_password}
+      POSTGRES_DB: ${POSTGRES_DB:-sso_idp}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sso_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sso-network
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Redis Cache & Token Management
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  redis:
+    image: redis:7-alpine
+    container_name: sso-idp-redis
+    command: redis-server --appendonly yes --requirepass redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sso-network
+    restart: unless-stopped
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Django SSO IdP Application
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  django:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sso-idp-django
+    command: >
+      sh -c "
+        echo 'Waiting for PostgreSQL...' &&
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        echo 'Creating superuser...' &&
+        python manage.py shell < scripts/create_superuser.py &&
+        echo 'Starting Gunicorn...' &&
+        gunicorn config.wsgi:application 
+          --bind 0.0.0.0:8000 
+          --workers 4 
+          --worker-class sync 
+          --access-logfile - 
+          --error-logfile - 
+          --log-level info
+      "
+    environment:
+      DEBUG: ${DEBUG:-False}
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,sso-idp}
+      
+      # Database
+      POSTGRES_DB: ${POSTGRES_DB:-sso_idp}
+      POSTGRES_USER: ${POSTGRES_USER:-sso_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sso_password}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      
+      # Redis
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      CACHE_URL: redis://:redis_password@redis:6379/1
+      
+      # OAuth2
+      OAUTH_TOKEN_EXPIRY_ACCESS: ${OAUTH_TOKEN_EXPIRY_ACCESS:-3600}
+      OAUTH_TOKEN_EXPIRY_REFRESH: ${OAUTH_TOKEN_EXPIRY_REFRESH:-604800}
+      PKCE_REQUIRED: ${PKCE_REQUIRED:-True}
+      
+      # CORS
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8080}
+      
+      # Security
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-False}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-False}
+      CSRF_COOKIE_SECURE: ${CSRF_COOKIE_SECURE:-False}
+      
+      # Admin
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@sso-idp.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-secure_admin_password}
+      
+      # JWT
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      JWT_PRIVATE_KEY: /app/certs/private_key.pem
+      JWT_PUBLIC_KEY: /app/certs/public_key.pem
+      
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./certs:/app/certs
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - sso-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  sso-network:
+    driver: bridge
